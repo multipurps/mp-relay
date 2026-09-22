@@ -25,35 +25,6 @@ use danog\MadelineProto\RPCError\SessionPasswordNeededError;
 
 header('Content-Type: application/json');
 
-// Temporary, unauthenticated on purpose - just to verify the Postgres
-// connection actually works from a browser, no header needed. Remove once
-// confirmed.
-if ($_SERVER['REQUEST_METHOD'] === 'GET' && parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) === '/health') {
-    try {
-        // Mirrors exactly what Postgres.php's own getOrmSettings() does
-        // internally (verified against that source directly), rather than
-        // going through an unverified method chain.
-        $config = new \Amp\Postgres\PostgresConfig(
-            host: getenv('SUPABASE_DB_HOST'),
-            port: (int) (getenv('SUPABASE_DB_PORT') ?: 5432),
-            user: getenv('SUPABASE_DB_USER'),
-            password: getenv('SUPABASE_DB_PASSWORD'),
-            database: getenv('SUPABASE_DB_NAME') ?: 'postgres',
-        );
-        $conn = \Amp\Postgres\connect($config);
-        $conn->query('select 1');
-        echo json_encode([
-            'postgres' => 'ok',
-            'telegram_api_id_set' => getenv('TELEGRAM_API_ID') !== false && getenv('TELEGRAM_API_ID') !== '',
-            'telegram_api_hash_set' => getenv('TELEGRAM_API_HASH') !== false && getenv('TELEGRAM_API_HASH') !== '',
-        ]);
-    } catch (\Throwable $e) {
-        http_response_code(500);
-        echo json_encode(['postgres' => 'failed', 'error' => $e->getMessage()]);
-    }
-    exit;
-}
-
 // Every route requires this - matches the pattern already used for the
 // other two relays (server-social/social-relay.js, WaCalls), since this
 // service would otherwise be a completely open door to anyone's linked
