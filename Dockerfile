@@ -21,14 +21,13 @@ COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 WORKDIR /app
 COPY composer.json ./
 RUN composer install --no-dev --no-interaction --optimize-autoloader \
-    && echo '=====READABLESTREAM=====' \
-    && grep -rl 'interface ReadableStream' vendor/amphp | xargs cat \
-    && echo '=====WRITABLESTREAM=====' \
-    && grep -rl 'interface WritableStream' vendor/amphp | xargs cat \
-    && echo '=====WEBSOCKETCONNECTION=====' \
-    && (grep -rl 'class WebsocketConnection\|interface WebsocketConnection' vendor/amphp | xargs cat || true) \
+    && echo '=====CLOSABLE=====' \
+    && grep -rl 'interface Closable' vendor/amphp vendor/revolt 2>/dev/null | xargs cat \
+    && echo '=====READABLEITERABLESTREAM=====' \
+    && find vendor/amphp/byte-stream -iname 'ReadableIterableStream.php' | xargs cat \
+    && echo '=====PIPELINEQUEUE=====' \
+    && find vendor/amphp/pipeline -iname 'Queue.php' | xargs cat \
     && echo '=====DONE====='
-
 COPY . .
 
 EXPOSE 10000
