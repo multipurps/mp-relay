@@ -4,9 +4,16 @@ FROM php:8.3-cli
 # the real key exchange this service exists to do correctly) needs it.
 # pgsql/pdo_pgsql: the Postgres-backed session storage.
 # sockets: MTProto's underlying transport.
+# ffmpeg + ffi: needed for /calls only - realtime audio conversion between
+# Telegram's OGG Opus and the assistant bridge's raw PCM16 (see
+# bin/server.php's CallBridge for exactly where each is used). Login-only
+# routes do not touch either.
 RUN apt-get update && apt-get install -y \
-    libgmp-dev libpq-dev unzip git \
+    libgmp-dev libpq-dev libffi-dev ffmpeg unzip git \
     && docker-php-ext-install gmp sockets pgsql pdo_pgsql \
+    && docker-php-ext-configure ffi --with-ffi \
+    && docker-php-ext-install ffi \
+    && echo "ffi.enable=1" >> /usr/local/etc/php/conf.d/ffi.ini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
@@ -18,4 +25,4 @@ RUN composer install --no-dev --no-interaction --optimize-autoloader
 COPY . .
 
 EXPOSE 10000
-CMD php -S 0.0.0.0:${PORT:-10000} -t public public/index.php
+CMD ["php", "bin/server.php"]
