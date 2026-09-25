@@ -20,14 +20,8 @@ COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
 WORKDIR /app
 COPY composer.json ./
-RUN composer install --no-dev --no-interaction --optimize-autoloader \
-    && echo '=====CLOSABLE=====' \
-    && grep -rl 'interface Closable' vendor/amphp vendor/revolt 2>/dev/null | xargs cat \
-    && echo '=====READABLEITERABLESTREAM=====' \
-    && find vendor/amphp/byte-stream -iname 'ReadableIterableStream.php' | xargs cat \
-    && echo '=====PIPELINEQUEUE=====' \
-    && find vendor/amphp/pipeline -iname 'Queue.php' | xargs cat \
-    && echo '=====DONE====='
+RUN composer install --no-dev --no-interaction --optimize-autoloader
+
 COPY . .
 
 EXPOSE 10000
