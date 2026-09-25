@@ -17,23 +17,25 @@
  * one persistent process with a single event loop, where the call's audio
  * pump is a background coroutine and HTTP requests are handled concurrently
  * on the same loop. amphp/http-server (a dependency MadelineProto already
- * pulls in, since MadelineProto itself is built on amphp/revolt) is exactly
- * this: a long-running async HTTP server, not a one-shot script per request.
+ * pulls in transitively, since MadelineProto itself is built on amphp) is
+ * exactly this: a long-running async HTTP server, not a one-shot script per
+ * request.
  *
  * Every existing login route is ported here unchanged in behaviour so this
  * is a drop-in replacement, not a parallel service.
  *
  * WHAT IS GENUINELY UNVERIFIED
  * -----------------------------
- * I have no PHP interpreter with amphp/madelineproto actually installed
- * (this sandbox has no access to packagist.org to `composer install`), and
- * no live Telegram account to place a real call against. This file is
- * syntax-checked (`php -l`) but has never been run. Three specific things
- * can only be confirmed on a live call - each is marked below with
- * "UNVERIFIED":
- *   1. Whether legacy-engine `play()` accepts a raw-PCM ReadableStream via
- *      its documented realtime-conversion path, or needs a specific
- *      container/sample-rate hint.
+ * I have no PHP interpreter with amphp/madelineproto actually installed in
+ * my own sandbox (no access to packagist.org there), so every interface used
+ * below was confirmed by having Render's own build print the real installed
+ * source (amphp/byte-stream v2.1.2, amphp/pipeline v1.2.7, amphp/websocket-
+ * client v2.0.2) rather than guessed. What is NOT verified, because it needs
+ * a live Telegram account and a real call, is:
+ *   1. Whether the legacy call engine's `play()` realtime-conversion path
+ *      (Tools::canConvertOgg(), needs ffmpeg + the FFI extension, both added
+ *      to the Dockerfile) accepts this raw PCM16 stream directly, or needs a
+ *      container/sample-rate hint play() has no parameter for.
  *   2. Whether a bare phone number (not already a mutual contact) resolves
  *      via `contacts.importContacts` at all - Telegram's privacy settings
  *      can refuse this independently of the code being correct.
@@ -41,17 +43,16 @@
  *      negotiates - this changes the exact audio container on both sides.
  */
 
-use Amp\ByteStream\ReadableStream;
+use Amp\ByteStream\ReadableIterableStream;
 use Amp\ByteStream\WritableStream;
-use Amp\DeferredFuture;
 use Amp\Http\HttpStatus;
 use Amp\Http\Server\HttpErrorException;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\RequestHandler\ClosureRequestHandler;
 use Amp\Http\Server\Response;
 use Amp\Http\Server\SocketHttpServer;
+use Amp\Pipeline\Queue;
 use Amp\Process\Process;
-use Amp\Socket\BindContext;
 use Amp\Socket\InternetAddress;
 use Amp\Websocket\Client\WebsocketHandshake;
 use Amp\Websocket\WebsocketCloseCode;
@@ -63,8 +64,6 @@ use danog\MadelineProto\Settings\AppInfo;
 use danog\MadelineProto\Settings\Database\Postgres;
 use danog\MadelineProto\VoIP\CallState;
 use danog\MadelineProto\VoIP\DiscardReason;
-use Monolog\Logger as NullPsrLoggerPlaceholder; // not used; keeps IDEs from flagging an unused-import lint on some setups
-use Psr\Log\NullLogger;
 use Revolt\EventLoop;
 
 use function Amp\async;
@@ -76,12 +75,6 @@ require __DIR__ . '/../vendor/autoload.php';
 // ---------------------------------------------------------------------------
 // Shared config / helpers (behaviour-identical to the old public/index.php)
 // ---------------------------------------------------------------------------
-
-function envOrNull(string $key): ?string
-{
-    $v = getenv($key);
-    return $v === false || $v === '' ? null : $v;
-}
 
 /** One MadelineProto session per user, cached for the life of this process. */
 final class SessionPool
@@ -129,8 +122,8 @@ function readJsonBody(Request $request): array
 // Header: magic(4) version(1) type(1) encoding(1) channels(1) sample_rate(4,
 // LE) sequence(4, LE) timestamp_ms(8, LE) payload_len(4, LE) = 28 bytes.
 // PHP's pack() 'I'/'Q' are NATIVE byte order, not little-endian - this uses
-// 'V' (uint32 LE) and 'P' (uint64 LE), which is the actual fix needed versus
-// the sketch in docs/MP-RELAY-INTEGRATION.md.
+// 'V' (uint32 LE) and 'P' (uint64 LE), which is a real fix versus the sketch
+// in docs/MP-RELAY-INTEGRATION.md (which used 'I'/'Q').
 // ---------------------------------------------------------------------------
 
 final class AcafFrameType
@@ -145,8 +138,6 @@ final class AcafFrameType
 final class AcafEncoding
 {
     public const PCM_S16LE = 1;
-    public const MULAW = 2;
-    public const OGG_OPUS = 3;
 }
 
 function acafPack(int $type, int $sampleRate, int $sequence, string $payload): string
@@ -190,83 +181,19 @@ function acafUnpack(string $data): array
     ];
 }
 
-// ---------------------------------------------------------------------------
-// A ReadableStream that Telegram's play() pulls from. Frames are pushed in
-// as they arrive from the assistant over the WebSocket; `interrupt()` drops
-// everything not yet handed to Telegram (barge-in). This is hand-written
-// against Amp\DeferredFuture / Amp\ByteStream\ReadableStream rather than
-// amphp/pipeline's Queue, specifically so interrupt can clear pending data -
-// Queue has no such operation.
-// ---------------------------------------------------------------------------
-final class OutboundAudioSource implements ReadableStream
-{
-    /** @var \SplQueue<string> */
-    private \SplQueue $pending;
-    private ?DeferredFuture $waiting = null;
-    private bool $closed = false;
-
-    public function __construct()
-    {
-        $this->pending = new \SplQueue();
-    }
-
-    public function push(string $bytes): void
-    {
-        if ($this->closed) {
-            return;
-        }
-        $this->pending->push($bytes);
-        if ($this->waiting !== null) {
-            $w = $this->waiting;
-            $this->waiting = null;
-            $w->complete();
-        }
-    }
-
-    /** Barge-in: drop everything not yet pulled by Telegram. */
-    public function interrupt(): void
-    {
-        while (!$this->pending->isEmpty()) {
-            $this->pending->shift();
-        }
-    }
-
-    public function read(?\Amp\Cancellation $cancellation = null): ?string
-    {
-        while ($this->pending->isEmpty()) {
-            if ($this->closed) {
-                return null;
-            }
-            $this->waiting = new DeferredFuture();
-            $this->waiting->getFuture()->await($cancellation);
-        }
-        return $this->pending->shift();
-    }
-
-    public function isReadable(): bool
-    {
-        return !$this->closed;
-    }
-
-    public function close(): void
-    {
-        $this->closed = true;
-        if ($this->waiting !== null) {
-            $w = $this->waiting;
-            $this->waiting = null;
-            $w->complete();
-        }
-    }
-}
-
 /**
  * A WritableStream that Telegram's setOutput() writes the caller's raw OGG
  * Opus audio into. Just forwards every chunk to a callback - the ffmpeg
- * decode happens outside this class (see CallBridge::pumpInbound).
+ * decode happens outside this class (see CallBridge::startInboundDecoder).
+ * Matches the real Amp\ByteStream\WritableStream shape confirmed against the
+ * installed amphp/byte-stream v2.1.2 source: write()/end()/isWritable() plus
+ * Closable's close()/isClosed()/onClose().
  */
 final class ForwardingSink implements WritableStream
 {
     private bool $closed = false;
+    /** @var list<\Closure> */
+    private array $onCloseCallbacks = [];
 
     public function __construct(private readonly \Closure $onChunk)
     {
@@ -281,17 +208,33 @@ final class ForwardingSink implements WritableStream
 
     public function end(): void
     {
-        $this->closed = true;
+        $this->close();
+    }
+
+    public function isWritable(): bool
+    {
+        return !$this->closed;
     }
 
     public function close(): void
     {
+        if ($this->closed) {
+            return;
+        }
         $this->closed = true;
+        foreach ($this->onCloseCallbacks as $cb) {
+            $cb();
+        }
     }
 
     public function isClosed(): bool
     {
         return $this->closed;
+    }
+
+    public function onClose(\Closure $onClose): void
+    {
+        $this->onCloseCallbacks[] = $onClose;
     }
 }
 
@@ -305,6 +248,7 @@ final class CallBridge
     private int $outSeq = 0;
     private bool $stopping = false;
     private ?Process $decodeProc = null;
+    private Queue $outboundQueue;
 
     public function __construct(
         private readonly \danog\MadelineProto\EventHandler\Calls\PrivateCall $call,
@@ -314,6 +258,7 @@ final class CallBridge
         private readonly string $bridgeSecret,
         private readonly int $bridgeSampleRate,
     ) {
+        $this->outboundQueue = new Queue();
     }
 
     /** Runs for the life of the call. Never throws - failures set status=failed. */
@@ -333,20 +278,17 @@ final class CallBridge
                 'secret' => $this->bridgeSecret,
             ], JSON_THROW_ON_ERROR));
 
-            $outbound = new OutboundAudioSource();
-
             // Outbound: assistant's speech -> Telegram.
-            // UNVERIFIED: this assumes the legacy engine's realtime-conversion
-            // path (Tools::canConvertOgg(), which needs ffmpeg + the FFI
-            // extension present in the image) accepts a raw PCM16 stream
+            // UNVERIFIED (see file header, point 1): assumes the legacy
+            // engine's realtime-conversion path accepts a raw PCM16 stream
             // directly. If a live call throws "please pre-convert it using
             // ... ffmpeg", this is the line that needs a manual PCM->OGG
             // Opus encode step in front of it instead.
-            $this->call->play($outbound, MediaDestination::Camera);
+            $this->call->play(new ReadableIterableStream($this->outboundQueue->pipe()), MediaDestination::Camera);
 
             // Inbound: caller's speech -> assistant. setOutput() hands us
             // raw OGG Opus bytes (MadelineProto's own docs: "pipe OGG OPUS
-            // audio data to ffmpeg...") - we decode with a real ffmpeg
+            // audio data to ffmpeg...") - decoded with a real ffmpeg
             // subprocess, not a guessed shortcut.
             $this->startInboundDecoder($connection);
             $this->call->setOutput(new ForwardingSink(function (string $chunk): void {
@@ -369,18 +311,18 @@ final class CallBridge
                     break;
                 }
                 if ($message->isText()) {
-                    $this->handleControl($outbound, json_decode($message->buffer(), true) ?: []);
+                    $this->handleControl(json_decode($message->buffer(), true) ?: []);
                 } else {
                     $frame = acafUnpack($message->buffer());
                     if ($frame['type'] === AcafFrameType::AUDIO_OUT) {
-                        $outbound->push($frame['payload']);
+                        $this->pushOutbound($frame['payload']);
                     } elseif ($frame['type'] === AcafFrameType::INTERRUPT) {
-                        $outbound->interrupt();
+                        $this->interrupt();
                     }
                     // HEARTBEAT frames need no action beyond having been read.
                 }
             }
-            $outbound->close();
+            $this->outboundQueue->complete();
             $connection->close(WebsocketCloseCode::NORMAL_CLOSE, 'call ended');
         } catch (\Throwable $e) {
             error_log('[call ' . $this->callId . '] bridge failed: ' . $e->getMessage());
@@ -390,23 +332,53 @@ final class CallBridge
         }
     }
 
-    private function handleControl(OutboundAudioSource $outbound, array $msg): void
+    private function pushOutbound(string $bytes): void
+    {
+        try {
+            $this->outboundQueue->push($bytes);
+        } catch (\Throwable) {
+            // queue already completed/errored (e.g. mid-interrupt) - drop it.
+        }
+    }
+
+    /**
+     * Barge-in. Amp\Pipeline\Queue has no "clear pending items" operation,
+     * so true interrupt here means: end the stream Telegram is currently
+     * playing from, and immediately start a fresh, empty one so new audio
+     * can flow with no old audio ahead of it. Audio already handed to
+     * Telegram cannot be recalled either way - same caveat the ACAF spec
+     * itself states.
+     */
+    private function interrupt(): void
+    {
+        $old = $this->outboundQueue;
+        $this->outboundQueue = new Queue();
+        try {
+            $old->complete();
+        } catch (\Throwable) {
+        }
+        try {
+            $this->call->play(new ReadableIterableStream($this->outboundQueue->pipe()), MediaDestination::Camera);
+        } catch (\Throwable $e) {
+            error_log('[call ' . $this->callId . '] interrupt re-play failed: ' . $e->getMessage());
+        }
+    }
+
+    private function handleControl(array $msg): void
     {
         switch ($msg['type'] ?? null) {
             case 'ready':
                 $this->status = 'connected';
                 break;
-            case 'ping':
-                // handled by the underlying websocket connection's own pong;
-                // amphp/websocket answers protocol-level pings automatically.
-                break;
             case 'interrupt':
-                $outbound->interrupt();
+                $this->interrupt();
                 break;
             case 'hangup':
             case 'stopped':
                 $this->requestStop('assistant ended the call');
                 break;
+            // 'ping' is answered at the websocket protocol level by
+            // amphp/websocket-client itself; no action needed here.
         }
     }
 
