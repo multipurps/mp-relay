@@ -5,10 +5,8 @@
     "php": ">=8.2",
     "danog/madelineproto": "^8",
     "amphp/http-server": "^3.3",
-    "amphp/websocket-client": "^4.0",
-    "amphp/websocket": "^3.0",
-    "amphp/byte-stream": "^2.1",
-    "amphp/process": "^2.0",
-    "amphp/socket": "^2.3"
+    "amphp/websocket-client": "^2.0.2",
+    "amphp/websocket": "^2.0",
+    "amphp/process": "^2.0"
   }
 }
