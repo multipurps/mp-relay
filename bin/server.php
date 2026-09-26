@@ -249,16 +249,63 @@ final class CallBridge
     private bool $stopping = false;
     private ?Process $decodeProc = null;
     private Queue $outboundQueue;
+    private ?float $connectedAt = null;
 
     public function __construct(
         private readonly \danog\MadelineProto\EventHandler\Calls\PrivateCall $call,
         private readonly int $callId,
-        private readonly string $sessionId,
+        private readonly string $bridgeSessionId,
         private readonly string $bridgeUrl,
         private readonly string $bridgeSecret,
         private readonly int $bridgeSampleRate,
+        // Everything below is for reporting back to the Audio-call- app's
+        // own chat thread when the call ends (see reportOutcome()) - it has
+        // nothing to do with the assistant bridge above and is optional:
+        // an old client that still calls POST /calls without these just
+        // gets no completion message, same as before this existed.
+        private readonly ?string $appApiUrl,
+        private readonly ?string $appCallbackSecret,
+        private readonly ?string $appUserId,
+        private readonly ?string $appSessionId,
+        private readonly ?string $contactName,
+        private readonly string $peerIdentifier,
     ) {
         $this->outboundQueue = new Queue();
+    }
+
+    /**
+     * Tells the Audio-call- app a call ended, so it can post a natural
+     * "Finished the call with X" / "couldn't reach them" message into the
+     * same chat thread the call was placed from - the app's own rule is
+     * that a call is never shown separately from its chat, so without this
+     * a Telegram call just vanishes with no record once it ends.
+     * UNVERIFIED: needs RELAY_CALLBACK_SECRET set to match on both sides
+     * and APP_API_URL to be this app's real deployed domain - neither of
+     * which I can confirm from here.
+     */
+    private function reportOutcome(string $status, ?int $durationSeconds): void
+    {
+        if ($this->appApiUrl === null || $this->appCallbackSecret === null || $this->appUserId === null || $this->appSessionId === null) {
+            return; // not configured - silently skip, same as before this existed
+        }
+        try {
+            $body = json_encode([
+                'userId' => $this->appUserId,
+                'sessionId' => $this->appSessionId,
+                'platform' => 'telegram',
+                'status' => $status,
+                'durationSeconds' => $durationSeconds,
+                'peerIdentifier' => $this->peerIdentifier,
+                'contactName' => $this->contactName,
+            ], JSON_THROW_ON_ERROR);
+            $request = new \Amp\Http\Client\Request(rtrim($this->appApiUrl, '/') . '/api/relay-call-status', 'POST');
+            $request->setHeader('content-type', 'application/json');
+            $request->setHeader('x-relay-secret', $this->appCallbackSecret);
+            $request->setBody($body);
+            (\Amp\Http\Client\HttpClientBuilder::buildDefault())->request($request);
+        } catch (\Throwable $e) {
+            error_log('[call ' . $this->callId . '] reportOutcome failed: ' . $e->getMessage());
+        }
     }
 
     /** Runs for the life of the call. Never throws - failures set status=failed. */
@@ -369,6 +416,7 @@ final class CallBridge
         switch ($msg['type'] ?? null) {
             case 'ready':
                 $this->status = 'connected';
+                $this->connectedAt ??= microtime(true);
                 break;
             case 'interrupt':
                 $this->interrupt();
@@ -423,8 +471,17 @@ final class CallBridge
             return;
         }
         $this->stopping = true;
+        $wasConnected = $this->status === 'connected';
         $this->status = 'ended';
         error_log('[call ' . $this->callId . '] stopping: ' . $reason);
+        // Simplification, flagged as such: Telegram's DiscardReason could in
+        // principle distinguish "they declined"/"busy" from a real failure,
+        // but I don't have a live call to confirm which reason value shows
+        // up for which real-world case, so this only distinguishes
+        // completed (it connected at some point) from failed (it never
+        // did) - not a separate "no answer" state.
+        $durationSeconds = $wasConnected && $this->connectedAt !== null ? (int) round(microtime(true) - $this->connectedAt) : null;
+        $this->reportOutcome($wasConnected ? 'completed' : 'failed', $durationSeconds);
     }
 
     public function hangup(): void
@@ -446,6 +503,11 @@ $secret = getenv('MP_RELAY_INTERNAL_SECRET') ?: '';
 $bridgeUrl = getenv('ASSISTANT_BRIDGE_URL') ?: '';
 $bridgeSecret = getenv('ASSISTANT_BRIDGE_SECRET') ?: '';
 $bridgeSampleRate = (int) (getenv('ASSISTANT_BRIDGE_SAMPLE_RATE') ?: 16000);
+// For reporting a call's end back into the Audio-call- app's own chat
+// thread (see CallBridge::reportOutcome). All optional - if unset, calls
+// still work exactly as before, just with no completion message.
+$appApiUrl = getenv('APP_API_URL') ?: null;
+$appCallbackSecret = getenv('RELAY_CALLBACK_SECRET') ?: null;
 
 $pool = new SessionPool();
 /** @var array<string, CallBridge> */
@@ -458,7 +520,7 @@ $requireSecret = static function (Request $request) use ($secret): void {
     }
 };
 
-$handler = new ClosureRequestHandler(function (Request $request) use ($pool, &$activeCalls, $requireSecret, $bridgeUrl, $bridgeSecret, $bridgeSampleRate): Response {
+$handler = new ClosureRequestHandler(function (Request $request) use ($pool, &$activeCalls, $requireSecret, $bridgeUrl, $bridgeSecret, $bridgeSampleRate, $appApiUrl, $appCallbackSecret): Response {
     $method = $request->getMethod();
     $path = $request->getUri()->getPath();
 
@@ -521,6 +583,13 @@ $handler = new ClosureRequestHandler(function (Request $request) use ($pool, &$a
             $body = readJsonBody($request);
             $userId = trim((string) ($body['userId'] ?? ''));
             $to = trim((string) ($body['to'] ?? ''));
+            // Optional: the Audio-call- app's own chat-session id and the
+            // contact's display name, purely so this call's outcome can be
+            // reported back into that same chat when it ends. Missing
+            // either just means no completion message gets sent - the call
+            // itself is unaffected.
+            $appSessionId = $body['sessionId'] ?? null;
+            $contactName = $body['contactName'] ?? null;
             if ($userId === '' || $to === '') {
                 return jsonResponse(400, ['error' => 'userId and to are required']);
             }
@@ -557,8 +626,11 @@ $handler = new ClosureRequestHandler(function (Request $request) use ($pool, &$a
             }
 
             $callId = (string) $call->callID;
-            $sessionId = 'call-' . $callId;
-            $bridge = new CallBridge($call, $call->callID, $sessionId, $bridgeUrl, $bridgeSecret, $bridgeSampleRate);
+            $bridgeSessionId = 'call-' . $callId; // ACAF bridge session id - unrelated to the app's own chat sessionId above
+            $bridge = new CallBridge(
+                $call, $call->callID, $bridgeSessionId, $bridgeUrl, $bridgeSecret, $bridgeSampleRate,
+                $appApiUrl, $appCallbackSecret, $userId, $appSessionId, $contactName, $to,
+            );
             $activeCalls[$callId] = $bridge;
             async(function () use ($bridge, $callId, &$activeCalls): void {
                 $bridge->run();
