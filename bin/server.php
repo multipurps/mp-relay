@@ -298,7 +298,7 @@ final class CallBridge
                 'peerIdentifier' => $this->peerIdentifier,
                 'contactName' => $this->contactName,
             ], JSON_THROW_ON_ERROR);
-            $request = new \Amp\Http\Client\Request(rtrim($this->appApiUrl, '/') . '/api/relay-call-status', 'POST');
+            $request = new \Amp\Http\Client\Request(rtrim($this->appApiUrl, '/') . '/api/social-calling?action=relay-call-status', 'POST');
             $request->setHeader('content-type', 'application/json');
             $request->setHeader('x-relay-secret', $this->appCallbackSecret);
             $request->setBody($body);
