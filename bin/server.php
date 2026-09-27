@@ -87,6 +87,13 @@ final class SessionPool
         return $this->sessions[$userId] ??= $this->build($userId);
     }
 
+    /** Evicts a poisoned session so the next get() rebuilds from scratch
+     * instead of reusing an API instance stuck on a dead auth key. */
+    public function forget(string $userId): void
+    {
+        unset($this->sessions[$userId]);
+    }
+
     private function build(string $userId): API
     {
         $settings = new Settings;
@@ -103,6 +110,11 @@ final class SessionPool
         $settings->setDb($pg);
         return new API('mp_session_' . $userId, $settings);
     }
+}
+
+function isDeadAuthKey(\Throwable $e): bool
+{
+    return str_contains($e->getMessage(), 'AUTH_KEY_UNREGISTERED') || str_contains($e->getMessage(), 'SESSION_REVOKED');
 }
 
 function jsonResponse(int $status, array $body): Response
@@ -610,6 +622,10 @@ $handler = new ClosureRequestHandler(function (Request $request) use ($pool, &$a
                         'last_name' => '',
                     ]]);
                 } catch (\Throwable $e) {
+                    if (isDeadAuthKey($e)) {
+                        $pool->forget($userId);
+                        return jsonResponse(401, ['error' => 'Telegram session expired - please reconnect Telegram and try again']);
+                    }
                     return jsonResponse(502, ['error' => 'contact import failed: ' . $e->getMessage()]);
                 }
                 $users = $imported['users'] ?? [];
@@ -622,6 +638,10 @@ $handler = new ClosureRequestHandler(function (Request $request) use ($pool, &$a
             try {
                 $call = $mp->requestCall($target);
             } catch (\Throwable $e) {
+                if (isDeadAuthKey($e)) {
+                    $pool->forget($userId);
+                    return jsonResponse(401, ['error' => 'Telegram session expired - please reconnect Telegram and try again']);
+                }
                 return jsonResponse(502, ['error' => 'requestCall failed: ' . $e->getMessage()]);
             }
 
