@@ -175,7 +175,7 @@ final class SessionPool
                 ->setApiHash(getenv('TELEGRAM_API_HASH')),
         );
         $pg = (new Postgres)
-            ->setUri(getenv('SUPABASE_DB_HOST') . ':' . (getenv('SUPABASE_DB_PORT') ?: '5432'))
+            ->setUri(getenv('SUPABASE_DB_HOST') . ':' . relayDbPort())
             ->setUsername(getenv('SUPABASE_DB_USER'))
             ->setPassword(getenv('SUPABASE_DB_PASSWORD'))
             ->setDatabase(getenv('SUPABASE_DB_NAME') ?: 'postgres');
@@ -692,6 +692,11 @@ $handler = new ClosureRequestHandler(function (Request $request) use ($pool, &$a
                 return jsonResponse(200, ['status' => 'connected']);
             } catch (SessionPasswordNeededError) {
                 return jsonResponse(200, ['status' => 'need_2fa']);
+            } catch (\Throwable $e) {
+                if (str_contains($e->getMessage(), 'not waiting for the code')) {
+                    return jsonResponse(409, ['error' => 'That code request expired. Tap Connect to get a new code.']);
+                }
+                throw $e;
             }
         }
         if ($method === 'POST' && preg_match('#^/sessions/([^/]+)/2fa$#', $path, $m)) {

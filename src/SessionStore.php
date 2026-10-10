@@ -8,6 +8,13 @@
  * the session is opened. Saves happen after a login completes, periodically while the file set changes,
  * and when the process is told to stop.
  */
+/** Supabase's transaction pooler (6543) breaks prepared statements; session mode (5432) on the same host works. */
+function relayDbPort(): string
+{
+    $port = (string) (getenv('SUPABASE_DB_PORT') ?: '5432');
+    return $port === '6543' ? '5432' : $port;
+}
+
 final class SessionStore
 {
     private ?\PDO $pdo = null;
@@ -27,11 +34,12 @@ final class SessionStore
             $dsn = sprintf(
                 'pgsql:host=%s;port=%s;dbname=%s;sslmode=require',
                 getenv('SUPABASE_DB_HOST'),
-                getenv('SUPABASE_DB_PORT') ?: '5432',
+                relayDbPort(),
                 getenv('SUPABASE_DB_NAME') ?: 'postgres',
             );
             $this->pdo = new \PDO($dsn, (string) getenv('SUPABASE_DB_USER'), (string) getenv('SUPABASE_DB_PASSWORD'), [
                 \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+                \PDO::ATTR_EMULATE_PREPARES => true,
             ]);
             $this->pdo->exec(
                 'create table if not exists linked_account_sessions (' .

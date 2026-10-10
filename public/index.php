@@ -1,4 +1,5 @@
 <?php declare(strict_types=1);
+require_once __DIR__ . '/../src/SessionStore.php';
 
 // Telegram login relay using MadelineProto, backed directly by Postgres
 // (Supabase) for session storage via MadelineProto's native
@@ -60,7 +61,7 @@ function sessionFor(string $userId): API {
             ->setApiHash(getenv('TELEGRAM_API_HASH')),
     );
     $pg = (new Postgres)
-        ->setUri(getenv('SUPABASE_DB_HOST') . ':' . (getenv('SUPABASE_DB_PORT') ?: '5432'))
+        ->setUri(getenv('SUPABASE_DB_HOST') . ':' . relayDbPort())
         ->setUsername(getenv('SUPABASE_DB_USER'))
         ->setPassword(getenv('SUPABASE_DB_PASSWORD'))
         ->setDatabase(getenv('SUPABASE_DB_NAME') ?: 'postgres');
