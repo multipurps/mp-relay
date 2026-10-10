@@ -71,6 +71,7 @@ use function Amp\delay;
 use function Amp\Websocket\Client\connect;
 
 require __DIR__ . '/../vendor/autoload.php';
+require_once __DIR__ . '/../src/SessionStore.php';
 
 // ---------------------------------------------------------------------------
 // Shared config / helpers (behaviour-identical to the old public/index.php)
@@ -114,10 +115,48 @@ final class SessionPool
 {
     /** @var array<string, API> */
     private array $sessions = [];
+    private SessionStore $store;
+
+    public function __construct()
+    {
+        $this->store = new SessionStore('telegram');
+    }
 
     public function get(string $userId): API
     {
         return $this->sessions[$userId] ??= $this->build($userId);
+    }
+
+    private function sessionName(string $userId): string
+    {
+        return 'mp_session_' . $userId;
+    }
+
+    /** Persist this user's login to Supabase (after login, periodically, on shutdown). */
+    /** @var array<string,float> */
+    private array $lastPersist = [];
+
+    public function persist(string $userId, bool $force = true): void
+    {
+        $now = microtime(true);
+        if (!$force && $now - ($this->lastPersist[$userId] ?? 0.0) < 20.0) {
+            return;
+        }
+        $this->lastPersist[$userId] = $now;
+        $this->store->save($userId, sessionDir(), $this->sessionName($userId));
+    }
+
+    public function persistAll(bool $force = false): void
+    {
+        foreach (array_keys($this->sessions) as $userId) {
+            $this->persist((string) $userId, $force);
+        }
+    }
+
+    public function purge(string $userId): void
+    {
+        $this->forget($userId);
+        $this->store->delete($userId);
     }
 
     /** Evicts a poisoned session so the next get() rebuilds from scratch
@@ -141,7 +180,9 @@ final class SessionPool
             ->setPassword(getenv('SUPABASE_DB_PASSWORD'))
             ->setDatabase(getenv('SUPABASE_DB_NAME') ?: 'postgres');
         $settings->setDb($pg);
-        return new API(sessionDir() . '/mp_session_' . $userId, $settings);
+        // Bring the login back from Supabase first: the local disk is wiped on every deploy.
+        $this->store->restore($userId, sessionDir(), $this->sessionName($userId));
+        return new API(sessionDir() . '/' . $this->sessionName($userId), $settings);
     }
 }
 
@@ -595,7 +636,7 @@ final class CallBridge
 // ---------------------------------------------------------------------------
 
 if (!isPersistentMount(sessionDir())) {
-    error_log('WARNING: session dir ' . sessionDir() . ' is NOT on a persistent volume - every restart/sleep will log all Telegram users out. Mount a volume and set MP_SESSION_DIR.');
+    error_log('Session dir ' . sessionDir() . ' is local/ephemeral; logins are backed up to and restored from Supabase (linked_account_sessions).');
 } else {
     error_log('Session dir ' . sessionDir() . ' is on a persistent mount.');
 }
@@ -647,6 +688,7 @@ $handler = new ClosureRequestHandler(function (Request $request) use ($pool, &$a
             if ($code === '') return jsonResponse(400, ['error' => 'code required']);
             try {
                 $pool->get($m[1])->completePhoneLogin($code);
+                $pool->persist($m[1]);
                 return jsonResponse(200, ['status' => 'connected']);
             } catch (SessionPasswordNeededError) {
                 return jsonResponse(200, ['status' => 'need_2fa']);
@@ -656,11 +698,13 @@ $handler = new ClosureRequestHandler(function (Request $request) use ($pool, &$a
             $password = readJsonBody($request)['password'] ?? '';
             if ($password === '') return jsonResponse(400, ['error' => 'password required']);
             $pool->get($m[1])->complete2faLogin($password);
+            $pool->persist($m[1]);
             return jsonResponse(200, ['status' => 'connected']);
         }
         if ($method === 'GET' && preg_match('#^/sessions/([^/]+)/status$#', $path, $m)) {
             try {
                 $me = $pool->get($m[1])->getSelf();
+                $pool->persist($m[1], false);
                 return jsonResponse(200, ['status' => 'connected', 'username' => $me['username'] ?? null, 'firstName' => $me['first_name'] ?? null]);
             } catch (\Throwable) {
                 return jsonResponse(200, ['status' => 'disconnected']);
@@ -672,6 +716,7 @@ $handler = new ClosureRequestHandler(function (Request $request) use ($pool, &$a
             } catch (\Throwable) {
                 // already gone is fine
             }
+            $pool->purge($m[1]); // an explicit disconnect removes the stored login too
             return jsonResponse(200, ['status' => 'disconnected']);
         }
 
@@ -787,6 +832,23 @@ $server = SocketHttpServer::createForDirectAccess(new class extends \Psr\Log\Abs
 });
 $server->expose(new InternetAddress('0.0.0.0', (int) (getenv('PORT') ?: 10000)));
 $server->start($handler, new \Amp\Http\Server\DefaultErrorHandler());
+
+// Safety net: re-save every open login every 30s (skipped when unchanged) and on SIGTERM,
+// so a deploy at any moment cannot lose a session.
+EventLoop::repeat(30.0, static function () use ($pool): void {
+    $pool->persistAll();
+});
+if (defined('SIGTERM')) {
+    try {
+        EventLoop::onSignal(SIGTERM, static function () use ($pool, $server): void {
+            $pool->persistAll(true);
+            $server->stop();
+            exit(0);
+        });
+    } catch (\Throwable $e) {
+        error_log('[sessions] no SIGTERM handler: ' . $e->getMessage());
+    }
+}
 
 // Keep the process alive - the HTTP server and every call's background
 // coroutine all run on this same Revolt event loop.
