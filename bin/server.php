@@ -309,6 +309,8 @@ final class CallBridge
     private ?Process $decodeProc = null;
     private Queue $outboundQueue;
     private ?float $connectedAt = null;
+    private ?\Amp\Websocket\WebsocketConnection $connection = null;
+    private bool $answerSignalled = false;
 
     public function __construct(
         private readonly \danog\MadelineProto\EventHandler\Calls\PrivateCall $call,
@@ -380,11 +382,12 @@ final class CallBridge
     {
         try {
             $handshake = (new WebsocketHandshake($this->bridgeUrl))
-                ->withHeader('X-Assistant-Session', $this->sessionId);
+                ->withHeader('X-Assistant-Session', $this->bridgeSessionId);
             $connection = connect($handshake);
+            $this->connection = $connection;
             $connection->sendText(json_encode([
                 'type' => 'hello',
-                'sessionId' => $this->sessionId,
+                'sessionId' => $this->bridgeSessionId,
                 'platform' => 'telegram',
                 'sampleRate' => $this->bridgeSampleRate,
                 'channels' => 1,
@@ -482,8 +485,9 @@ final class CallBridge
     {
         switch ($msg['type'] ?? null) {
             case 'ready':
-                $this->status = 'connected';
-                $this->connectedAt ??= microtime(true);
+                // The assistant session is ready. That is NOT the callee answering:
+                // 'connected' is set only when Telegram reports the call is live
+                // (see signalAnswered()).
                 break;
             case 'interrupt':
                 $this->interrupt();
@@ -518,12 +522,37 @@ final class CallBridge
         });
     }
 
+    /**
+     * The callee picked up. The assistant holds its greeting, the live session, the
+     * transcript and the app's in-progress status until it receives `call_active`
+     * (ACAF), exactly as the WhatsApp relay sends it. Without this the callee hears
+     * silence and the app stays on "calling".
+     */
+    private function signalAnswered(): void
+    {
+        $this->answerSignalled = true;
+        $this->status = 'connected';
+        $this->connectedAt ??= microtime(true);
+        error_log('[call ' . $this->callId . '] callee answered; sending call_active');
+        try {
+            $this->connection?->sendText(json_encode([
+                'type' => 'call_active',
+                'sessionId' => $this->bridgeSessionId,
+            ], JSON_THROW_ON_ERROR));
+        } catch (\Throwable $e) {
+            error_log('[call ' . $this->callId . '] call_active send failed: ' . $e->getMessage());
+        }
+    }
+
     /** Polls Telegram's own call state (not the assistant's) to catch a real hangup. */
     private function watchCallState(): void
     {
         while (!$this->stopping) {
             delay(1.0);
             $state = $this->call->getCallState();
+            if (!$this->answerSignalled && ($state === CallState::CONFIRMED || $state === CallState::RUNNING)) {
+                $this->signalAnswered();
+            }
             if ($state === CallState::ENDED) {
                 $this->requestStop('telegram call ended');
                 return;
