@@ -76,6 +76,39 @@ require __DIR__ . '/../vendor/autoload.php';
 // Shared config / helpers (behaviour-identical to the old public/index.php)
 // ---------------------------------------------------------------------------
 
+/**
+ * Where MadelineProto saves each user's login (auth keys) as files. Postgres
+ * (setDb above) only holds its caches - the login itself is on local disk, so
+ * this MUST be a persistent volume or every restart logs every user out.
+ * Set MP_SESSION_DIR to a mounted volume path (e.g. /data/mp_sessions).
+ */
+function sessionDir(): string
+{
+    static $dir = null;
+    if ($dir !== null) {
+        return $dir;
+    }
+    $dir = rtrim(getenv('MP_SESSION_DIR') ?: '/data/mp_sessions', '/');
+    if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
+        $dir = '/app/mp_sessions'; // last resort; ephemeral
+        @mkdir($dir, 0700, true);
+    }
+    return $dir;
+}
+
+/** True if $dir lives on its own mount (a volume), not the container's wipeable root filesystem. */
+function isPersistentMount(string $dir): bool
+{
+    $best = '/';
+    foreach (@file('/proc/mounts', FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+        $mnt = explode(' ', $line)[1] ?? '';
+        if ($mnt !== '' && $mnt !== '/' && str_starts_with(rtrim($dir, '/') . '/', rtrim($mnt, '/') . '/') && strlen($mnt) > strlen($best)) {
+            $best = $mnt;
+        }
+    }
+    return $best !== '/';
+}
+
 /** One MadelineProto session per user, cached for the life of this process. */
 final class SessionPool
 {
@@ -108,7 +141,7 @@ final class SessionPool
             ->setPassword(getenv('SUPABASE_DB_PASSWORD'))
             ->setDatabase(getenv('SUPABASE_DB_NAME') ?: 'postgres');
         $settings->setDb($pg);
-        return new API('mp_session_' . $userId, $settings);
+        return new API(sessionDir() . '/mp_session_' . $userId, $settings);
     }
 }
 
@@ -253,6 +286,20 @@ final class ForwardingSink implements WritableStream
 // ---------------------------------------------------------------------------
 // One Telegram call, bridged to the Pipecat assistant.
 // ---------------------------------------------------------------------------
+/**
+ * ffmpeg (used by MadelineProto to convert a played stream to OGG Opus) must be
+ * able to identify the input; headerless raw PCM cannot be probed and fails.
+ * So the outbound stream is a WAV stream: this header declares PCM16 mono at
+ * $sampleRate with unknown length (0xFFFFFFFF, the standard streaming-WAV form),
+ * followed by the raw PCM chunks the assistant sends.
+ */
+function wavStreamHeader(int $sampleRate): string
+{
+    return 'RIFF' . pack('V', 0xFFFFFFFF) . 'WAVE'
+        . 'fmt ' . pack('VvvVVvv', 16, 1, 1, $sampleRate, $sampleRate * 2, 2, 16)
+        . 'data' . pack('V', 0xFFFFFFFF);
+}
+
 final class CallBridge
 {
     public string $status = 'ringing'; // ringing | connected | ended | failed
@@ -282,7 +329,15 @@ final class CallBridge
         private readonly ?string $contactName,
         private readonly string $peerIdentifier,
     ) {
-        $this->outboundQueue = new Queue();
+        $this->outboundQueue = $this->newOutboundQueue();
+    }
+
+    /** A fresh outbound queue that already starts with the WAV header ffmpeg needs. */
+    private function newOutboundQueue(): Queue
+    {
+        $queue = new Queue();
+        $queue->push(wavStreamHeader($this->bridgeSampleRate));
+        return $queue;
     }
 
     /**
@@ -411,7 +466,7 @@ final class CallBridge
     private function interrupt(): void
     {
         $old = $this->outboundQueue;
-        $this->outboundQueue = new Queue();
+        $this->outboundQueue = $this->newOutboundQueue();
         try {
             $old->complete();
         } catch (\Throwable) {
@@ -466,11 +521,10 @@ final class CallBridge
     /** Polls Telegram's own call state (not the assistant's) to catch a real hangup. */
     private function watchCallState(): void
     {
-        $api = $this->call->getAPI();
         while (!$this->stopping) {
             delay(1.0);
-            $state = $api->getCallState($this->callId);
-            if ($state === null || $state === CallState::ENDED) {
+            $state = $this->call->getCallState();
+            if ($state === CallState::ENDED) {
                 $this->requestStop('telegram call ended');
                 return;
             }
@@ -511,6 +565,11 @@ final class CallBridge
 // Bootstrap
 // ---------------------------------------------------------------------------
 
+if (!isPersistentMount(sessionDir())) {
+    error_log('WARNING: session dir ' . sessionDir() . ' is NOT on a persistent volume - every restart/sleep will log all Telegram users out. Mount a volume and set MP_SESSION_DIR.');
+} else {
+    error_log('Session dir ' . sessionDir() . ' is on a persistent mount.');
+}
 $secret = getenv('MP_RELAY_INTERNAL_SECRET') ?: '';
 $bridgeUrl = getenv('ASSISTANT_BRIDGE_URL') ?: '';
 $bridgeSecret = getenv('ASSISTANT_BRIDGE_SECRET') ?: '';
